@@ -26,20 +26,9 @@ import static org.junit.Assert.fail;
 
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
-import io.grpc.CallOptions;
-import io.grpc.Channel;
-import io.grpc.ClientCall;
-import io.grpc.ClientInterceptor;
+import io.grpc.*;
 import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
 import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
-import io.grpc.ManagedChannel;
-import io.grpc.Metadata;
-import io.grpc.MethodDescriptor;
-import io.grpc.Server;
-import io.grpc.ServerServiceDefinition;
-import io.grpc.ServiceDescriptor;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.internal.NoopClientCall;
@@ -747,26 +736,89 @@ public class ClientCallsTest {
 
   // Used for blocking tests to check interrupt behavior and make sure onClose is still called.
   class InterruptInterceptor implements ClientInterceptor {
-    boolean onCloseCalled;
+      boolean onCloseCalled;
 
-    @Override
-    public <ReqT,RespT> ClientCall<ReqT, RespT> interceptCall(
-        MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
-      return new SimpleForwardingClientCall<ReqT, RespT>(next.newCall(method, callOptions)) {
-        @Override public void start(ClientCall.Listener<RespT> listener, Metadata headers) {
-          super.start(new SimpleForwardingClientCallListener<RespT>(listener) {
-            @Override public void onClose(Status status, Metadata trailers) {
-              onCloseCalled = true;
-              super.onClose(status, trailers);
-            }
-          }, headers);
-        }
+      @Override
+      public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(
+              MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+          return new SimpleForwardingClientCall<ReqT, RespT>(next.newCall(method, callOptions)) {
+              @Override
+              public void start(ClientCall.Listener<RespT> listener, Metadata headers) {
+                  super.start(new SimpleForwardingClientCallListener<RespT>(listener) {
+                      @Override
+                      public void onClose(Status status, Metadata trailers) {
+                          onCloseCalled = true;
+                          super.onClose(status, trailers);
+                      }
+                  }, headers);
+              }
 
-        @Override public void halfClose() {
-          Thread.currentThread().interrupt();
-          super.halfClose();
-        }
-      };
-    }
+              @Override
+              public void halfClose() {
+                  Thread.currentThread().interrupt();
+                  super.halfClose();
+              }
+          };
+      }
   }
+    @Test
+    public void blockingServerStreamingCall2_cancelledWaitsForOnClose() throws Exception {
+        Integer req = 2;
+        final Integer resp1 = 3;
+        final Integer resp2 = 4;
+
+        class SimpleServerStreamingMethod implements ServerStreamingMethod<Integer, Integer> {
+            ServerCallStreamObserver<Integer> observer;
+
+            @Override public void invoke(Integer request, StreamObserver<Integer> responseObserver) {
+                observer = (ServerCallStreamObserver<Integer>) responseObserver;
+                responseObserver.onNext(resp1);
+                responseObserver.onNext(resp2);
+                responseObserver.onCompleted();
+            }
+        }
+
+        SimpleServerStreamingMethod methodImpl = new SimpleServerStreamingMethod();
+        server = InProcessServerBuilder.forName("noop").directExecutor()
+                .addService(ServerServiceDefinition.builder("some")
+                        .addMethod(SERVER_STREAMING_METHOD, ServerCalls.asyncServerStreamingCall(methodImpl))
+                        .build())
+                .build().start();
+
+        CloseCheckInterceptor interceptor = new CloseCheckInterceptor();
+        channel = InProcessChannelBuilder.forName("noop")
+                .directExecutor()
+                .intercept(interceptor)
+                .build();
+        Context.CancellableContext cancellableContext = Context.current().withCancellation();
+        Context old = cancellableContext.attach();
+        try {
+            Iterator<Integer> iter = ClientCalls.blockingServerStreamingCall(
+                    channel, SERVER_STREAMING_METHOD, CallOptions.DEFAULT, req);
+            iter.hasNext();
+        } finally {
+            cancellableContext.detachAndCancel(old,null);
+        }
+        assertTrue("onCloseCalled", interceptor.onCloseCalled);
+    }
+
+
+    class CloseCheckInterceptor implements ClientInterceptor {
+        boolean onCloseCalled;
+
+        @Override
+        public <ReqT,RespT> ClientCall<ReqT, RespT> interceptCall(
+                MethodDescriptor<ReqT, RespT> method, CallOptions callOptions, Channel next) {
+            return new SimpleForwardingClientCall<ReqT, RespT>(next.newCall(method, callOptions)) {
+                @Override public void start(ClientCall.Listener<RespT> listener, Metadata headers) {
+                    super.start(new SimpleForwardingClientCallListener<RespT>(listener) {
+                        @Override public void onClose(Status status, Metadata trailers) {
+                            onCloseCalled = true;
+                            super.onClose(status, trailers);
+                        }
+                    }, headers);
+                }
+            };
+        }
+    }
 }
